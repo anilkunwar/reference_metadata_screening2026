@@ -1,6 +1,7 @@
-# app.py - BibTeX Hallucination Validator (Complete Expanded Version)
+# app.py - BibTeX Hallucination Validator (Complete Expanded Version with Working LLM)
 # ============================================================================
-# Features: Robust author matching, CPU-safe LLM loading, clean BibTeX output
+# Features: Robust author matching, CPU-safe LLM loading with @st.cache_resource,
+#           clean BibTeX output, dropdown model selection that actually works
 # ============================================================================
 
 import streamlit as st
@@ -262,7 +263,7 @@ def fetch_crossref_metadata(doi: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
     url = f"{CROSSREF_API_URL}{quote(clean_doi_val)}"
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     data = make_api_request(url, headers, timeout)
-    if not data or "message" not in 
+    if not data or "message" not in data:
         return None
     msg = data["message"]
     result = {
@@ -283,10 +284,10 @@ def fetch_crossref_metadata(doi: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
     titles = msg.get("title", [])
     result["title"] = titles[0] if titles and isinstance(titles, list) and len(titles) > 0 else None
     
-    # FIXED: Complete author extraction loop
+    # FIXED: Complete author extraction loop - was truncated as 'authors_'
     authors_data = msg.get("author", [])
     if authors_data and isinstance(authors_data, list):
-        for author in authors_
+        for author in authors_data:
             if isinstance(author, dict):
                 given = author.get("given", "") or ""
                 family = author.get("family", "") or ""
@@ -305,7 +306,7 @@ def fetch_crossref_metadata(doi: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
     
     for date_field in ["published-print", "published-online", "created", "deposited"]:
         date_data = msg.get(date_field)
-        if date_
+        if date_data:
             yr = extract_year_from_date(date_data)
             if yr: 
                 result["year"] = yr
@@ -373,7 +374,7 @@ def search_crossref_by_title(title: str, max_results: int = TITLE_SEARCH_MAX_RES
     params = {"query.title": title, "rows": max_results, "select": "DOI,title,author,container-title,published-print,volume,page,type,score"}
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     data = make_api_request(url, headers, timeout, params)
-    if not data or "message" not in 
+    if not data or "message" not in data:
         return []
     items = data["message"].get("items", [])
     results = []
@@ -504,45 +505,43 @@ def merge_metadata_entries(original: Dict[str, Any], verified: Dict[str, Any],
             merged[f"_flag_reason_{field}"] = f"Discrepancy: orig='{res['original']}', verified='{res['verified']}', conf={res['confidence']}"
     return merged
 
-# ==================== LLM Integration Functions ====================
+# ==================== LLM Integration Functions - KEY FIXES FOR LOADING ====================
 
-def initialize_llm_pipeline(model_name: str, device: Optional[str] = None) -> Optional[Any]:
+@st.cache_resource
+def _load_llm_model_cached(model_id: str, device: str):
+    """
+    Internal cached function to load LLM model - decorated with @st.cache_resource.
+    This is the KEY to making dropdown LLM loading work like the Core-Shell app.
+    """
     if not TRANSFORMERS_AVAILABLE or not TORCH_AVAILABLE:
-        return None
+        return None, None
+    
+    logger.info(f"Loading {model_id} on {device} (cached)")
+    
     try:
-        mapping = {"gpt2": "gpt2", "distilgpt2": "distilgpt2", "Qwen2.5-0.5B-Instruct": "Qwen/Qwen2.5-0.5B-Instruct"}
-        model_id = mapping.get(model_name, model_name)
-        
-        # Detect device safely
-        if device is None:
-            if torch.cuda.is_available():
-                dev = "cuda"
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                dev = "mps"
-            else:
-                dev = "cpu"
-        else:
-            dev = device
-            
-        logger.info(f"Loading {model_id} on {dev}")
-        
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         if tok.pad_token is None: 
             tok.pad_token = tok.eos_token
             
-        # CPU-safe model loading
-        if dev == "cpu":
+        # CPU-safe model loading with appropriate dtype
+        if device == "cpu":
             model = AutoModelForCausalLM.from_pretrained(
                 model_id, 
                 torch_dtype=torch.float32, 
                 low_cpu_mem_usage=True,
                 trust_remote_code=True
             )
-        else:
+        elif device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16,
+                trust_remote_code=True
+            ).to("mps")
+        else:  # cuda
             model = AutoModelForCausalLM.from_pretrained(
                 model_id, 
-                torch_dtype=torch.float16, 
-                device_map="auto",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map="auto" if torch.cuda.device_count() > 1 else None,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True
             )
@@ -557,10 +556,65 @@ def initialize_llm_pipeline(model_name: str, device: Optional[str] = None) -> Op
             repetition_penalty=1.2
         )
         
-        return pipeline("text-generation", model=model, tokenizer=tok, device=0 if dev!="cpu" else -1, generation_config=gen_conf)
+        pipe = pipeline(
+            "text-generation", 
+            model=model, 
+            tokenizer=tok, 
+            device=0 if device == "cuda" else (-1 if device == "cpu" else None),
+            generation_config=gen_conf
+        )
+        
+        return tok, pipe
+        
     except Exception as e:
-        logger.error(f"LLM init failed: {type(e).__name__}: {e}")
+        logger.error(f"Failed to load {model_id}: {type(e).__name__}: {e}")
+        return None, None
+
+
+def initialize_llm_pipeline(model_name: str, device: Optional[str] = None) -> Optional[Any]:
+    """
+    Initialize LLM pipeline using cached loader - matches Core-Shell app pattern.
+    Returns pipeline object or None if loading fails.
+    """
+    if not TRANSFORMERS_AVAILABLE or not TORCH_AVAILABLE:
+        logger.warning("Transformers or PyTorch not available")
         return None
+    
+    try:
+        # Map user-friendly names to HuggingFace model IDs
+        mapping = {
+            "gpt2 (~124M)": "gpt2",
+            "distilgpt2 (~82M)": "distilgpt2", 
+            "Qwen2.5-0.5B-Instruct (~0.5B)": "Qwen/Qwen2.5-0.5B-Instruct"
+        }
+        model_id = mapping.get(model_name, model_name)
+        
+        # Detect device safely - matches Core-Shell app logic
+        if device is None:
+            if torch.cuda.is_available():
+                dev = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                dev = "mps"
+            else:
+                dev = "cpu"
+        else:
+            dev = device
+            
+        logger.info(f"Initializing LLM: {model_name} -> {model_id} on {dev}")
+        
+        # Use cached loader - THIS IS THE KEY FIX
+        tokenizer, pipe = _load_llm_model_cached(model_id, dev)
+        
+        if pipe is None:
+            logger.warning(f"Pipeline creation failed for {model_id}")
+            return None
+            
+        return pipe
+        
+    except Exception as e:
+        logger.error(f"LLM init failed: {type(e).__name__}: {e}", exc_info=True)
+        return None
+
 
 def build_llm_prompt_for_metadata_refinement(original: Dict[str, Any], verified: Dict[str, Any], discrepancies: Dict[str, Dict]) -> str:
     fields_needing = {k: v for k, v in discrepancies.items() if v.get("needs_review") and v.get("verified") is not None}
@@ -603,6 +657,7 @@ OUTPUT:
 """
     return prompt
 
+
 def parse_llm_output_for_bibtex_fields(llm_output: str) -> Dict[str, str]:
     if not llm_output or "# NO_CHANGES_REQUIRED" in llm_output: 
         return {}
@@ -617,6 +672,7 @@ def parse_llm_output_for_bibtex_fields(llm_output: str) -> Dict[str, str]:
             if f in FIELDS_TO_VALIDATE: 
                 corrections[f] = v
     return corrections
+
 
 def refine_metadata_with_llm(original: Dict[str, Any], verified: Dict[str, Any], discrepancies: Dict[str, Dict], llm_pipe: Any) -> Dict[str, Any]:
     if llm_pipe is None: 
@@ -668,6 +724,7 @@ def parse_bibtex_file_content(file_content: bytes) -> Tuple[List[Dict], Optional
     except Exception as e:
         return [], f"Parsing error: {type(e).__name__}: {e}"
 
+
 def generate_bibtex_entry_string(entry: Dict[str, Any], cite_key: Optional[str] = None) -> str:
     key = cite_key or entry.get("cite_key", "unknown_key")
     etype = entry.get("entry_type", "article")
@@ -687,7 +744,8 @@ def generate_bibtex_entry_string(entry: Dict[str, Any], cite_key: Optional[str] 
     lines.append("}")
     return "\n".join(lines)
 
-def generate_complete_bibtex_file(entries: List[Dict[str, Any]], meta Dict[str, Any]) -> str:
+
+def generate_complete_bibtex_file(entries: List[Dict[str, Any]], metadata: Dict[str, Any]) -> str:
     header = f"""% ================================================================================
 % Hallucination-Validated BibTeX References
 % ================================================================================
@@ -704,6 +762,7 @@ def generate_complete_bibtex_file(entries: List[Dict[str, Any]], meta Dict[str, 
 # ==================== Streamlit Main Application ====================
 
 def main():
+    # Initialize session state for persistent data across reruns
     if "validation_results" not in st.session_state: 
         st.session_state.validation_results = []
     if "llm_pipeline" not in st.session_state: 
@@ -712,171 +771,547 @@ def main():
         st.session_state.current_model = None
     if "processing_complete" not in st.session_state: 
         st.session_state.processing_complete = False
+    if "llm_load_error" not in st.session_state:
+        st.session_state.llm_load_error = None
 
     st.title("📚 BibTeX Hallucination Validator")
     st.markdown("**Upload a `.bib` file** to validate references against Crossref & OpenAlex APIs. Detects and corrects hallucinated metadata, with robust author name matching.")
 
     with st.sidebar:
         st.header("⚙️ Settings")
+        
+        # LLM Model Selection - dropdown that actually triggers loading
+        st.subheader("🤖 LLM Refinement (Optional)")
         llm_opts = ["None (API-only)", "gpt2 (~124M)", "distilgpt2 (~82M)", "Qwen2.5-0.5B-Instruct (~0.5B)"]
-        sel_model = st.selectbox("LLM Refinement Model", llm_opts, index=0)
+        sel_model = st.selectbox("Select model for metadata refinement:", llm_opts, index=0)
         use_llm = sel_model != "None (API-only)"
         
+        # KEY FIX: Load LLM when dropdown changes - matches Core-Shell app pattern
         if use_llm and (st.session_state.llm_pipeline is None or st.session_state.current_model != sel_model):
-            with st.status(f"Loading {sel_model}...", expanded=True) as status:
+            with st.status(f"🔄 Loading {sel_model}...", expanded=True) as status:
                 st.write("Initializing tokenizer & model weights...")
-                dev = "GPU/MPS" if (torch.cuda.is_available() or (hasattr(torch.backends, "mps") and torch.backends.mps.is_available())) else "CPU"
-                st.write(f"Target device: {dev}")
-                if dev == "CPU" and "Qwen" in sel_model:
+                
+                # Detect device for display
+                if torch.cuda.is_available():
+                    dev_display = "GPU (CUDA)"
+                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    dev_display = "Apple Silicon (MPS)"
+                else:
+                    dev_display = "CPU"
+                st.write(f"Target device: {dev_display}")
+                
+                # Warn about CPU loading for large models
+                if dev_display == "CPU" and "Qwen" in sel_model:
                     st.warning("⚠️ Qwen2.5-0.5B on CPU requires ~1.2GB RAM and 30-60s to load. May timeout on free tiers.")
-                p = initialize_llm_pipeline(sel_model)
-                if p: 
-                    st.session_state.llm_pipeline = p
+                
+                # Attempt to load with cached function
+                pipeline = initialize_llm_pipeline(sel_model)
+                
+                if pipeline:
+                    st.session_state.llm_pipeline = pipeline
                     st.session_state.current_model = sel_model
-                    status.update(label=f"✅ {sel_model} loaded", state="complete")
-                else: 
-                    status.update(label="⚠️ Load failed, using API-only", state="error")
-                    st.info("💡 Author matching still works via rule-based normalization. LLM is only needed for highly ambiguous cases.")
-                    use_llm = False
-
-        timeout = st.slider("API Timeout (s)", 5, 60, 10, 5)
-        auto_correct = st.checkbox("Auto-correct high-confidence matches", True)
-        show_diff = st.checkbox("Show field comparison", True)
-        include_unverified = st.checkbox("Include unverified in output", True)
-        user_email = st.text_input("Email for Crossref User-Agent", "validator@example.com")
+                    st.session_state.llm_load_error = None
+                    status.update(label=f"✅ {sel_model} loaded successfully", state="complete", expanded=False)
+                    st.success(f"Model ready for refinement!")
+                else:
+                    st.session_state.llm_load_error = f"Failed to load {sel_model}"
+                    status.update(label=f"⚠️ Load failed - using API-only", state="error", expanded=False)
+                    st.warning("LLM refinement disabled. Author matching still works via rule-based normalization.")
+                    use_llm = False  # Disable LLM usage for this session
         
-        global USER_AGENT
-        if user_email and "example.com" not in user_email: 
+        # Display load error if present
+        if st.session_state.llm_load_error:
+            st.error(f"❌ {st.session_state.llm_load_error}")
+            if st.button("🔄 Retry Loading"):
+                st.session_state.llm_pipeline = None
+                st.session_state.current_model = None
+                st.rerun()
+        
+        # Advanced Options
+        st.subheader("🔧 Advanced Options")
+        
+        timeout = st.slider("API request timeout (seconds)", 5, 60, 10, 5,
+                          help="Increase for slower network connections")
+        
+        auto_correct = st.checkbox("Auto-correct high-confidence matches", True,
+                                 help="Automatically fix fields where verified data confidently differs from original")
+        
+        show_diff = st.checkbox("Show field-by-field comparison", True,
+                              help="Display side-by-side view of original vs verified metadata")
+        
+        include_unverified = st.checkbox("Include unverified entries in output", True,
+                                       help="Keep entries that couldn't be verified (with warning flags)")
+        
+        # Rate limiting notice
+        st.info("""
+        **Rate Limiting Notice**  
+        Crossref API: ~50 requests/minute without API key  
+        OpenAlex API: ~100 requests/minute  
+        Large files may take several minutes to process.
+        """)
+        
+        # User email for Crossref API (required)
+        user_email = st.text_input("Your email (for Crossref API User-Agent):",
+                                 value="validator@example.com",
+                                 help="Required by Crossref API policy. Replace with your actual email.")
+        if user_email and "example.com" not in user_email:
+            global USER_AGENT
             USER_AGENT = f"BibTeX-Validator/1.0 (mailto:{user_email})"
-
-    st.subheader("📁 Upload BibTeX")
-    uploaded = st.file_uploader("Choose .bib file", type=["bib", "txt"])
-    if not uploaded:
-        st.info("👆 Upload a BibTeX file to start.")
-        st.stop()
-
-    with st.spinner("Parsing entries..."):
-        entries, err = parse_bibtex_file_content(uploaded.getvalue())
-    if err: 
-        st.error(f"❌ {err}")
-        st.stop()
-    if not entries: 
-        st.error("❌ No valid entries found.")
-        st.stop()
-    st.success(f"✅ Found **{len(entries)}** references")
-
-    st.subheader("🔄 Validation Progress")
-    prog = st.progress(0)
-    status_txt = st.empty()
-    log = st.expander("📋 Progress Log", expanded=False)
-    results = []
-
-    for idx, entry in enumerate(entries):
-        prog.progress((idx+1)/len(entries))
-        ck = entry.get("cite_key", f"entry_{idx}")
-        title = safe_string_slice(entry.get("title"), 60)
-        doi = entry.get("doi", "")
-        status_txt.text(f"🔍 [{idx+1}/{len(entries)}] {title}")
-
-        verified = None
-        # 1. DOI Lookup
-        if doi:
-            cdoi = clean_doi(doi)
-            if cdoi:
-                verified = fetch_crossref_metadata(doi, timeout)
-                if not verified: 
-                    verified = fetch_openalex_metadata(doi, timeout)
         
-        # 2. Title Search Fallback
-        if not verified and entry.get("title"):
-            t_res = search_crossref_by_title(entry["title"], TITLE_SEARCH_MAX_RESULTS, timeout)
-            if t_res:
-                best = next((r for r in t_res if r.get("match_score",0)>=0.9 and r.get("doi")), None)
-                if best: 
-                    verified = fetch_crossref_metadata(best["doi"], timeout)
-
-        # 3. Process Result
-        if verified:
-            disc = compare_metadata_fields(entry, verified)
-            n_flag = sum(1 for d in disc.values() if d.get("needs_review"))
-            with log: 
-                st.text(f"`{ck}`: {'✅ Match' if n_flag==0 else f'⚠️ {n_flag} flags'}")
-            
-            if use_llm and st.session_state.llm_pipeline and n_flag > 0:
-                corrected = refine_metadata_with_llm(entry, verified, disc, st.session_state.llm_pipeline)
-            else:
-                corrected = merge_metadata_entries(entry, verified, disc, auto_correct)
-            
-            results.append({"cite_key": ck, "original": entry, "verified": verified, "discrepancies": disc, "corrected": corrected, "status": "verified", "source": verified.get("source")})
+        st.divider()
+        
+        # Quick stats
+        st.subheader("📊 Session Stats")
+        if st.session_state.validation_results:
+            results = st.session_state.validation_results
+            verified = sum(1 for r in results if r.get("verified"))
+            flagged = sum(1 for r in results if any(
+                d.get("needs_review") for d in r.get("discrepancies", {}).values()
+            ))
+            st.metric("✅ Verified", verified)
+            st.metric("⚠️ Flagged", flagged)
+            st.metric("📋 Total", len(results))
         else:
-            disc = {f: {"original": entry.get(f), "verified": None, "match": False, "confidence": "low", "needs_review": True} for f in FIELDS_TO_VALIDATE if entry.get(f)}
-            corrected = entry.copy()
-            corrected["_warning"] = "⚠️ No external verification found"
-            results.append({"cite_key": ck, "original": entry, "verified": None, "discrepancies": disc, "corrected": corrected, "status": "unverified", "source": None})
-            with log: 
-                st.warning(f"`{ck}`: ❌ Unverified")
+            st.caption("Upload a file to see validation statistics")
+
+    # ==================== File Upload Section ====================
+    st.subheader("📁 Upload BibTeX File")
+    
+    uploaded_file = st.file_uploader(
+        "Choose a `.bib` or `.txt` file containing your references",
+        type=["bib", "txt"],
+        help="File should contain valid BibTeX entries (@article, @inproceedings, etc.)"
+    )
+    
+    if uploaded_file is None:
+        st.info("👆 Please upload a BibTeX file to begin validation.")
+        
+        # Show sample file format help
+        with st.expander("📋 Example BibTeX Entry Format"):
+            st.code("""
+@article{Author2024Title,
+  author  = {Last, First and Another, Person},
+  title   = {Article Title with Proper Capitalization},
+  journal = {Full Journal Name},
+  year    = {2024},
+  volume  = {12},
+  pages   = {123--456},
+  doi     = {10.1234/example.doi}
+}
+            """, language="bibtex")
+        st.stop()
+    
+    # ==================== File Processing ====================
+    with st.spinner("🔍 Parsing BibTeX entries..."):
+        entries, parse_error = parse_bibtex_file_content(uploaded_file.getvalue())
+    
+    if parse_error:
+        st.error(f"❌ {parse_error}")
+        st.stop()
+    
+    if not entries:
+        st.error("❌ No valid BibTeX entries found. Please check your file format.")
+        st.stop()
+    
+    st.success(f"✅ Found **{len(entries)}** reference(s) to validate")
+    
+    # ==================== Validation Progress UI ====================
+    st.subheader("🔄 Validation Progress")
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    progress_details = st.expander("📋 Detailed Progress Log", expanded=False)
+    
+    validated_results = []
+    
+    # Process each entry sequentially with progress updates
+    for idx, entry in enumerate(entries):
+        # Update progress display
+        progress = (idx + 1) / len(entries)
+        progress_bar.progress(progress)
+        
+        cite_key = entry.get("cite_key", f"entry_{idx}")
+        original_title = safe_string_slice(entry.get("title"), 60)
+        original_doi = entry.get("doi", "")
+        
+        status_text.text(f"🔍 [{idx+1}/{len(entries)}] {original_title}")
+        
+        # Log to detailed view
+        with progress_details:
+            st.caption(f"`{cite_key}`: {original_title}")
+        
+        # ==================== Step 1: DOI-Based Lookup ====================
+        verified_metadata = None
+        
+        if original_doi:
+            clean_doi = clean_doi(original_doi)
+            if clean_doi:
+                # Try Crossref first (primary source)
+                with progress_details:
+                    st.text(f"  → Querying Crossref for DOI: {clean_doi}")
+                verified_metadata = fetch_crossref_metadata(original_doi, timeout=timeout)
+                
+                # Fallback to OpenAlex if Crossref fails
+                if not verified_metadata:
+                    with progress_details:
+                        st.text(f"  → Crossref not found, trying OpenAlex...")
+                    verified_metadata = fetch_openalex_metadata(original_doi, timeout=timeout)
+                    
+                    if verified_metadata:
+                        with progress_details:
+                            st.success(f"  ✓ Found via OpenAlex")
+                    else:
+                        with progress_details:
+                            st.warning(f"  ✗ Not found in Crossref or OpenAlex")
+                else:
+                    with progress_details:
+                        st.success(f"  ✓ Found via Crossref")
+        
+        # ==================== Step 2: Title Search Fallback ====================
+        if not verified_metadata and entry.get("title"):
+            with progress_details:
+                st.text(f"  → DOI lookup failed, searching by title...")
+            
+            title_results = search_crossref_by_title(
+                entry["title"], 
+                max_results=TITLE_SEARCH_MAX_RESULTS, 
+                timeout=timeout
+            )
+            
+            if title_results:
+                with progress_details:
+                    st.text(f"  → Found {len(title_results)} potential matches")
+                
+                # Select best match by score threshold
+                best_match = None
+                for result in title_results:
+                    if result.get("match_score", 0) >= 0.9 and result.get("doi"):
+                        best_match = result
+                        break
+                
+                if best_match and best_match["doi"]:
+                    with progress_details:
+                        st.text(f"  → Best match (score={best_match['match_score']:.2f}): {best_match['title'][:50]}...")
+                    # Fetch full metadata for the matched DOI
+                    verified_metadata = fetch_crossref_metadata(best_match["doi"], timeout=timeout)
+                    if verified_metadata:
+                        with progress_details:
+                            st.success(f"  ✓ Verified via title match + DOI lookup")
+        
+        # ==================== Step 3: Metadata Comparison ====================
+        if verified_metadata:
+            # Compare original vs verified fields
+            discrepancies = compare_metadata_fields(entry, verified_metadata)
+            
+            # Count discrepancies for logging
+            needs_review_count = sum(
+                1 for d in discrepancies.values() if d.get("needs_review")
+            )
+            
+            with progress_details:
+                if needs_review_count == 0:
+                    st.success(f"  ✓ All fields match - no corrections needed")
+                else:
+                    st.warning(f"  ⚠ {needs_review_count} field(s) need review")
+            
+            # ==================== Step 4: Apply Corrections ====================
+            # Merge metadata with optional LLM refinement
+            if use_llm and st.session_state.llm_pipeline and needs_review_count > 0:
+                with progress_details:
+                    st.text(f"  → Running LLM refinement with {sel_model}...")
+                corrected_entry = refine_metadata_with_llm(
+                    entry, verified_metadata, discrepancies, 
+                    st.session_state.llm_pipeline
+                )
+            else:
+                corrected_entry = merge_metadata_entries(
+                    entry, verified_metadata, discrepancies, 
+                    auto_correct=auto_correct
+                )
+            
+            # Store result
+            validated_results.append({
+                "cite_key": cite_key,
+                "original": entry,
+                "verified": verified_metadata,
+                "discrepancies": discrepancies,
+                "corrected": corrected_entry,
+                "status": "verified",
+                "verification_source": verified_metadata.get("source", "unknown")
+            })
+            
+        else:
+            # No verification source found - flag for manual review
+            discrepancies = {
+                field: {
+                    "original": entry.get(field),
+                    "verified": None,
+                    "match": False,
+                    "confidence": "low",
+                    "needs_review": True
+                }
+                for field in FIELDS_TO_VALIDATE if entry.get(field)
+            }
+            
+            corrected_entry = entry.copy()
+            corrected_entry["_warning"] = "⚠️ Could not verify against external sources - manual review required"
+            corrected_entry["_unverified_fields"] = list(discrepancies.keys())
+            
+            validated_results.append({
+                "cite_key": cite_key,
+                "original": entry,
+                "verified": None,
+                "discrepancies": discrepancies,
+                "corrected": corrected_entry,
+                "status": "unverified",
+                "verification_source": None
+            })
+            
+            with progress_details:
+                st.warning(f"  ✗ No verification source found - entry flagged for manual review")
+        
+        # Small delay to respect API rate limits
         time.sleep(0.05)
-
-    prog.progress(1.0)
-    status_txt.text("✨ Validation complete!")
-    st.session_state.validation_results = results
+    
+    # Final progress update
+    progress_bar.progress(1.0)
+    status_text.text("✨ Validation complete!")
+    progress_bar.empty()
+    
+    # Store results in session state for persistence across reruns
+    st.session_state.validation_results = validated_results
     st.session_state.processing_complete = True
-
+    
+    # ==================== Results Summary ====================
     st.divider()
-    st.subheader("📊 Results Summary")
-    total = len(results)
-    ver_c = sum(1 for r in results if r["status"]=="verified")
-    flag_c = sum(1 for r in results if any(d.get("needs_review") for d in r.get("discrepancies",{}).values()))
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Total", total)
-    c2.metric("Verified", ver_c)
-    c3.metric("Unverified", total-ver_c)
-    c4.metric("Flagged", flag_c)
-
-    st.subheader("📋 Entry Details")
-    tbl = [{"Cite Key": f"`{r['cite_key']}`", "Title": safe_string_slice(r["original"].get("title"),70), 
-            "DOI": clean_doi(r["original"].get("doi")) or "N/A", 
-            "Status": "✅ Verified" if r["status"]=="verified" else "❌ Unverified",
-            "Source": r["source"] or "N/A", "Flags": sum(1 for d in r.get("discrepancies",{}).values() if d.get("needs_review"))} for r in results]
-    st.dataframe(tbl, use_container_width=True, hide_index=True)
-
+    st.subheader("📊 Validation Summary")
+    
+    # Calculate summary statistics
+    total_entries = len(validated_results)
+    verified_count = sum(1 for r in validated_results if r["status"] == "verified")
+    unverified_count = total_entries - verified_count
+    flagged_count = sum(
+        1 for r in validated_results 
+        if any(d.get("needs_review") for d in r.get("discrepancies", {}).values())
+    )
+    
+    # Display metrics in columns
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("📋 Total Entries", total_entries)
+    col2.metric("✅ Verified", verified_count, delta=f"{verified_count/total_entries*100:.1f}%" if total_entries > 0 else None)
+    col3.metric("❌ Unverified", unverified_count)
+    col4.metric("⚠️ Flagged for Review", flagged_count)
+    
+    # Progress visualization
+    if total_entries > 0:
+        st.progress(verified_count / total_entries, text=f"Verification Rate: {verified_count/total_entries*100:.1f}%")
+    
+    # ==================== Detailed Results Table ====================
+    st.subheader("📋 Entry-by-Entry Results")
+    
+    # Prepare data for table display
+    table_data = []
+    for result in validated_results:
+        row = {
+            "Cite Key": f"`{result['cite_key']}`",
+            "Title": safe_string_slice(result["original"].get("title"), 70),
+            "DOI": clean_doi(result["original"].get("doi")) or "N/A",
+            "Status": "✅ Verified" if result["status"] == "verified" else "❌ Unverified",
+            "Source": result.get("verification_source", "N/A") or "N/A",
+            "Fields Flagged": sum(1 for d in result.get("discrepancies", {}).values() if d.get("needs_review"))
+        }
+        table_data.append(row)
+    
+    # Display interactive table
+    st.dataframe(
+        table_data,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Cite Key": st.column_config.TextColumn("Cite Key", help="BibTeX citation key"),
+            "Title": st.column_config.TextColumn("Title", width="medium"),
+            "DOI": st.column_config.TextColumn("DOI", help="Digital Object Identifier"),
+            "Status": st.column_config.TextColumn("Status"),
+            "Source": st.column_config.TextColumn("Verification Source"),
+            "Fields Flagged": st.column_config.NumberColumn("Fields Flagged", help="Number of fields needing manual review")
+        }
+    )
+    
+    # ==================== Expandable Detailed Comparison View ====================
     if show_diff:
-        with st.expander("🔍 Detailed Comparison", expanded=False):
-            for r in results:
-                st.markdown(f"#### `{r['cite_key']}` — {r['original'].get('title','Untitled')[:70]}...")
-                if r["status"]=="verified": 
-                    st.success(f"✅ via {r['source']}")
-                else: 
-                    st.warning(r["corrected"].get("_warning","⚠️ Unverified"))
-                if r["discrepancies"]:
-                    comp = []
-                    for f, d in r["discrepancies"].items():
-                        orig_disp = safe_string_slice(d["original"], 40)
-                        ver_disp = safe_string_slice(d["verified"], 40) if d["verified"] is not None else "N/A"
-                        if isinstance(d["verified"], list):
-                            ver_disp = safe_string_slice(" and ".join(d["verified"]), 40)
-                        status_icon = "✅" if d["match"] else "⚠️" if d["needs_review"] else "➖"
-                        comp.append({"Field": f, "Original": orig_disp, "Verified": ver_disp, "Status": status_icon, "Confidence": d["confidence"]})
-                    st.dataframe(comp, use_container_width=True, hide_index=True)
-                st.divider()
-
+        with st.expander("🔍 Detailed Field Comparison View", expanded=False):
+            for result in validated_results:
+                with st.container():
+                    st.markdown(f"#### `{result['cite_key']}` — {result['original'].get('title', 'Untitled')[:80]}...")
+                    
+                    # Status indicator
+                    if result["status"] == "verified":
+                        st.success(f"✅ Verified via {result.get('verification_source', 'external source')}")
+                    else:
+                        st.warning(result["corrected"].get("_warning", "⚠️ Unverified - manual review required"))
+                    
+                    # Field comparison table
+                    if result["discrepancies"]:
+                        comparison_data = []
+                        for field, info in result["discrepancies"].items():
+                            status_icon = (
+                                "✅" if info["match"] else 
+                                "⚠️" if info["needs_review"] else 
+                                "➖"
+                            )
+                            comparison_data.append({
+                                "Field": field,
+                                "Original": safe_string_slice(info["original"], 40),
+                                "Verified": safe_string_slice(info["verified"], 40) if info["verified"] else "N/A",
+                                "Status": status_icon,
+                                "Confidence": info.get("confidence", "N/A")
+                            })
+                        
+                        if comparison_data:
+                            st.dataframe(
+                                comparison_data,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Status": st.column_config.TextColumn("Status", width="small"),
+                                    "Confidence": st.column_config.TextColumn("Confidence", width="small")
+                                }
+                            )
+                    
+                    st.divider()
+    
+    # ==================== Download Corrected BibTeX ====================
     st.divider()
-    st.subheader("💾 Download")
-    out = [r["corrected"] for r in results if r["status"]=="verified" or include_unverified]
-    meta = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "sources": "Crossref/OpenAlex", "llm_model": sel_model if use_llm else "Disabled", "verified_count": ver_c, "flagged_count": flag_c}
-    bib_content = generate_complete_bibtex_file(out, metadata=meta)
-    st.download_button("📥 Download validated_references.bib", bib_content, "validated_references.bib", "text/plain", type="primary")
-    with st.expander("👀 Preview (First 3)"):
-        for e in out[:3]: 
-            st.code(generate_bibtex_entry_string(e, e.get("cite_key","?")), "bibtex")
+    st.subheader("💾 Download Validated BibTeX File")
+    
+    # Prepare entries for output
+    output_entries = []
+    for result in validated_results:
+        # Skip unverified entries if user chose to exclude them
+        if result["status"] == "unverified" and not include_unverified:
+            continue
+        
+        # Use corrected entry (with internal flags removed for clean output)
+        entry_output = {
+            k: v for k, v in result["corrected"].items() 
+            if not k.startswith("_") or k in ["_warning"]  # Optionally keep warning
+        }
+        output_entries.append(entry_output)
+    
+    # Generate BibTeX content
+    generation_metadata = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sources": "Crossref API, OpenAlex API",
+        "llm_model": sel_model if use_llm else "Disabled",
+        "verified_count": verified_count,
+        "flagged_count": flagged_count
+    }
+    
+    bib_content = generate_complete_bibtex_file(output_entries, generation_metadata)
+    
+    # Create download button
+    st.download_button(
+        label="📥 Download validated_references.bib",
+        data=bib_content,
+        file_name="validated_references.bib",
+        mime="text/plain",
+        type="primary",
+        help="Download corrected BibTeX file ready for use in LaTeX documents"
+    )
+    
+    # Preview the output
+    with st.expander("👀 Preview First 3 Entries", expanded=False):
+        preview_entries = output_entries[:3]
+        for entry in preview_entries:
+            key = entry.get("cite_key", "unknown")
+            preview = generate_bibtex_entry_string(entry, key)
+            st.code(preview, language="bibtex")
             st.divider()
+    
+    # ==================== Help and Documentation ====================
+    with st.expander("❓ How This Tool Works", expanded=False):
+        st.markdown("""
+        ### Validation Pipeline
+        
+        1️⃣ **Parse Input**: Extract title, DOI, authors, and other fields from your BibTeX entries
+        
+        2️⃣ **DOI Lookup (Primary)**: Query Crossref API using DOI - most reliable method
+           - Falls back to OpenAlex API if Crossref has no record
+           - Handles DOI URL formats and normalization automatically
+        
+        3️⃣ **Title Search (Fallback)**: If DOI lookup fails, search Crossref by title
+           - Uses fuzzy matching with 85% similarity threshold
+           - Auto-selects best match if confidence score ≥90%
+        
+        4️⃣ **Field Comparison**: Compare each metadata field between original and verified
+           - Authors: Set-based comparison (order-independent, 70% overlap threshold)
+           - Titles: Fuzzy token-based similarity matching
+           - Year/Volume/Pages: Exact or substring matching
+           - Confidence scoring: high/medium/low based on match quality
+        
+        5️⃣ **Correction Application**: 
+           - Auto-correct: Fields with high/medium confidence matches
+           - Flag for review: Discrepancies with low confidence or missing verified data
+           - LLM refinement (optional): Resolve ambiguous author formatting, journal abbreviations
+        
+        6️⃣ **Output Generation**: Produce clean BibTeX with corrections applied and flags for manual review
+        
+        ### Understanding the Output
+        
+        - ✅ **Verified**: Entry matched external source with high confidence
+        - ⚠️ **Flagged**: Specific fields differ between original and verified - review recommended  
+        - ❌ **Unverified**: No matching record found in Crossref/OpenAlex - manual verification required
+        
+        Fields with `_flag_*` suffix in the output indicate discrepancies needing your attention.
+        
+        ### Best Practices
+        
+        🔹 Start with "API-only" mode for fastest processing of large files  
+        🔹 Use LLM refinement only for entries flagged with author/journal formatting issues  
+        🔹 Always manually review entries marked as unverified or with multiple flagged fields  
+        🔹 Update the User-Agent email in settings to comply with Crossref API policy  
+        🔹 For institutional use, consider adding API keys for higher rate limits
+        """)
+    
+    # ==================== Footer ====================
+    st.divider()
+    st.caption("""
+    **BibTeX Hallucination Validator v1.0** | 
+    Validation sources: Crossref API, OpenAlex API | 
+    LLM models: GPT-2, DistilGPT-2, Qwen2.5-0.5B (all <1.2B parameters) |
+    
+    *This tool assists with reference validation but does not replace expert scholarly review. 
+    Always verify critical references against original sources before publication.*
+    """)
 
-    st.caption("🔹 Author matching handles initials, full names, and 'Last, First' formatting automatically. LLM is optional. Always manually verify flagged entries.")
 
+# ==================== Application Entry Point ====================
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        # Catch-all error handler with detailed logging
         import traceback
-        st.error("❌ Unexpected Error\n" + traceback.format_exc())
-        st.info("💡 Refresh and retry. Ensure BibTeX is well-formatted.")
+        error_details = traceback.format_exc()
+        logger.critical(f"Unhandled exception in main(): {error_details}")
+        
+        st.error("""
+        ## ❌ Application Error
+        
+        An unexpected error occurred. This has been logged for debugging.
+        
+        **Troubleshooting steps:**
+        1. Refresh the page and try uploading your file again
+        2. Check that your BibTeX file is properly formatted
+        3. If using LLM features, ensure you have sufficient memory (~1-2GB VRAM for Qwen2.5-0.5B)
+        4. Try "API-only" mode if LLM loading fails
+        
+        **Error details for developers:**
+        """)
+        st.code(error_details, language="text")
+        
+        st.info("""
+        💡 **Quick fix**: If you see "AttributeError" related to entry fields, 
+        your BibTeX file may have non-standard field names. Try cleaning the file 
+        with a BibTeX validator like [JabRef](https://www.jabref.org/) first.
+        """)
