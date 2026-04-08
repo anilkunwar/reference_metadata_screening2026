@@ -297,4 +297,266 @@ Corrected fields:"""
 
 def create_bibtex_entry(entry: Dict, cite_key: str) -> str:
     """Create properly formatted BibTeX entry string"""
-    entry_type = entry.get("_type", "
+    entry_type = entry.get("_type", "article")
+    fields_to_include = ["author", "title", "journal", "booktitle", "year", "volume", 
+                        "number", "pages", "doi", "url", "publisher", "note"]
+    
+    lines = [f"@{entry_type}{{{cite_key},"]
+    for field in fields_to_include:
+        if field in entry and entry[field] and not field.startswith("_"):
+            value = entry[field]
+            # Format authors properly
+            if field == "author" and isinstance(value, list):
+                value = " and ".join(value)
+            # Escape special characters in title/journal
+            if field in ["title", "journal", "booktitle"]:
+                value = re.sub(r'([{}])', r'{\1}', str(value))
+            lines.append(f"  {field} = {{{value}}},")
+    
+    # Remove trailing comma and close
+    if lines[-1].endswith(","):
+        lines[-1] = lines[-1][:-1]
+    lines.append("}")
+    
+    return "\n".join(lines)
+
+# ==================== Streamlit UI ====================
+
+def main():
+    st.title("📚 BibTeX Hallucination Validator")
+    st.markdown("""
+    Upload a `.bib` file to validate references against **Crossref** and **OpenAlex** APIs.  
+    Optionally use small LLMs (<1B params) to help resolve ambiguous metadata.
+    """)
+    
+    # Sidebar: Model selection
+    with st.sidebar:
+        st.header("⚙️ Settings")
+        
+        # LLM Model dropdown
+        llm_options = [
+            "None (API-only verification)",
+            "gpt2 (~124M params)",
+            "distilgpt2 (~82M params)", 
+            "Qwen2.5-0.5B-Instruct (~0.5B params)*"
+        ]
+        selected_model = st.selectbox(
+            "Select LLM for metadata refinement:",
+            options=llm_options,
+            index=0,
+            help="*Qwen2.5-0.5B requires ~1GB VRAM. First load may take 30-60s."
+        )
+        
+        use_llm = selected_model != "None (API-only verification)"
+        
+        # Advanced options
+        st.subheader("Advanced")
+        timeout = st.slider("API timeout (seconds)", 5, 30, 10)
+        auto_correct = st.checkbox("Auto-correct high-confidence matches", value=True)
+        show_diff = st.checkbox("Show field-by-field comparison", value=True)
+        
+        st.info("💡 Tip: Start with 'None' mode for fast DOI validation. Use LLMs only for ambiguous cases.")
+    
+    # File uploader
+    uploaded_file = st.file_uploader("📁 Upload your reference.bib file", type=["bib", "txt"])
+    
+    if uploaded_file is None:
+        st.info("👆 Please upload a BibTeX file to begin validation.")
+        st.stop()
+    
+    # Parse file
+    with st.spinner("🔍 Parsing BibTeX entries..."):
+        entries = parse_bibtex_file(uploaded_file)
+    
+    if not entries:
+        st.error("❌ No valid BibTeX entries found. Please check your file format.")
+        st.stop()
+    
+    st.success(f"✅ Found {len(entries)} reference(s) to validate")
+    
+    # Progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    validated_entries = []
+    results_log = []
+    
+    # Process each entry
+    for idx, entry in enumerate(entries):
+        status_text.text(f"🔍 Validating {idx+1}/{len(entries)}: {entry.get('title', 'Untitled')[:50]}...")
+        
+        cite_key = entry.get("ID", f"entry_{idx}")
+        original_doi = entry.get("doi", "")
+        original_title = entry.get("title", "")
+        
+        # Step 1: Try DOI lookup (most reliable)
+        verified = None
+        if original_doi:
+            verified = fetch_crossref_metadata(original_doi, timeout=timeout)
+            if not verified:
+                verified = fetch_openalex_metadata(original_doi, timeout=timeout)
+        
+        # Step 2: Fallback to title search if DOI fails
+        if not verified and original_title:
+            with st.expander(f"🔎 Title search fallback for: {original_title[:60]}...", expanded=False):
+                title_results = search_by_title(original_title, max_results=3)
+                if title_results:
+                    st.write("Top matches found:")
+                    for i, res in enumerate(title_results, 1):
+                        st.markdown(f"{i}. **{res.get('title', '')}** (DOI: `{res.get('doi', 'N/A')}`)")
+                    # Auto-select best match if score is high
+                    best_match = max(title_results, key=lambda x: x.get("match_score", 0))
+                    if best_match.get("match_score", 0) > 0.9 and best_match.get("doi"):
+                        verified = fetch_crossref_metadata(best_match["doi"], timeout=timeout)
+                        if verified:
+                            st.success(f"✅ Auto-selected best match: {best_match['title'][:50]}...")
+        
+        # Step 3: Compare metadata
+        if verified:
+            discrepancies = compare_metadata(entry, verified)
+            # Generate corrected entry
+            if auto_correct:
+                corrected = generate_corrected_entry(
+                    entry, verified, discrepancies, 
+                    use_llm=use_llm, 
+                    model_name=selected_model
+                )
+            else:
+                corrected = entry.copy()
+                corrected["_verified_metadata"] = verified
+                corrected["_discrepancies"] = discrepancies
+        else:
+            # No verification found
+            discrepancies = {field: {"original": entry.get(field), "verified": None, 
+                                   "match": False, "needs_review": True} 
+                           for field in ["title", "authors", "journal", "year", "volume", "pages"]}
+            corrected = entry.copy()
+            corrected["_warning"] = "⚠️ No verification source found - manual review recommended"
+        
+        # Store results
+        validated_entries.append({
+            "cite_key": cite_key,
+            "original": entry,
+            "verified": verified,
+            "discrepancies": discrepancies if verified else None,
+            "corrected": corrected,
+            "status": "verified" if verified else "unverified"
+        })
+        
+        results_log.append({
+            "title": original_title[:80],
+            "doi": original_doi,
+            "status": "✅ Verified" if verified else "❌ Unverified",
+            "discrepancies_count": len([d for d in (discrepancies.values() if verified else []) if d.get("needs_review")]) if verified else "N/A"
+        })
+        
+        progress_bar.progress((idx + 1) / len(entries))
+        time.sleep(0.1)  # Rate limiting courtesy
+    
+    status_text.text("✨ Validation complete!")
+    progress_bar.empty()
+    
+    # Results summary
+    st.subheader("📊 Validation Summary")
+    col1, col2, col3 = st.columns(3)
+    verified_count = sum(1 for r in results_log if "✅" in r["status"])
+    col1.metric("✅ Verified", verified_count)
+    col2.metric("❌ Unverified", len(entries) - verified_count)
+    col3.metric("🔍 Total Entries", len(entries))
+    
+    # Detailed results table
+    st.subheader("📋 Entry-by-Entry Results")
+    results_df = st.dataframe(
+        results_log,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "title": "Reference Title",
+            "doi": "DOI",
+            "status": "Status",
+            "discrepancies_count": "Fields Needing Review"
+        }
+    )
+    
+    # Expandable detailed view
+    with st.expander("🔍 Detailed Comparison View", expanded=False):
+        for result in validated_entries:
+            with st.container():
+                st.markdown(f"#### `{result['cite_key']}` - {result['original'].get('title', 'Untitled')[:70]}...")
+                
+                if result["status"] == "verified":
+                    st.success("✅ Verified against external source")
+                    if show_diff and result["discrepancies"]:
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            st.markdown("**📝 Original**")
+                            for field, info in result["discrepancies"].items():
+                                status_icon = "✅" if info["match"] else "⚠️" if info["needs_review"] else "➖"
+                                st.text(f"{status_icon} {field}: {info['original']}")
+                        with col_b:
+                            st.markdown("**🔍 Verified**")
+                            for field, info in result["discrepancies"].items():
+                                status_icon = "✅" if info["match"] else "🔄" if info["needs_review"] else "➖"
+                                st.text(f"{status_icon} {field}: {info['verified']}")
+                else:
+                    st.warning(result["corrected"].get("_warning", "⚠️ Could not verify this reference"))
+                    with st.expander("📄 Original Entry"):
+                        st.code(create_bibtex_entry(result["original"], result["cite_key"]), language="bibtex")
+                
+                st.divider()
+    
+    # Generate and download corrected .bib file
+    st.subheader("💾 Download Corrected BibTeX")
+    
+    # Create corrected BibTeX content
+    writer = BibTexWriter()
+    writer.indent = "  "
+    corrected_bib = bibtexparser.bibdatabase.BibDatabase()
+    
+    for result in validated_entries:
+        entry_data = result["corrected"].copy()
+        # Clean internal flags
+        entry_data = {k: v for k, v in entry_data.items() if not k.startswith("_")}
+        # Ensure required fields
+        if "author" in entry_data and isinstance(entry_data["author"], list):
+            entry_data["author"] = " and ".join(entry_data["author"])
+        corrected_bib.entries.append(entry_data)
+    
+    bib_content = bibtexparser.dumps(corrected_bib, writer)
+    
+    # Add header comment
+    header = f"""% Hallucination-validated references
+% Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}
+% Verified via: Crossref API + OpenAlex API
+% LLM refinement: {'Yes (' + selected_model + ')' if use_llm else 'No'}
+% 
+"""
+    final_content = header + bib_content
+    
+    st.download_button(
+        label="📥 Download validated_references.bib",
+        data=final_content,
+        file_name="validated_references.bib",
+        mime="text/plain",
+        type="primary"
+    )
+    
+    # Footer
+    st.markdown("---")
+    st.caption("""
+    **How it works**:  
+    1️⃣ Extracts title/DOI from your BibTeX  
+    2️⃣ Queries Crossref API (primary) → OpenAlex API (fallback) → Title search (last resort)  
+    3️⃣ Compares metadata fields and flags discrepancies  
+    4️⃣ *(Optional)* Uses small LLM to help resolve ambiguous author/journal formatting  
+    5️⃣ Outputs cleaned, verified BibTeX ready for your manuscript  
+    
+    **Limitations**:  
+    • API rate limits may cause delays (Crossref: ~50 req/min)  
+    • Small LLMs (<1B params) have limited reasoning ability - always review flagged entries  
+    • Open access repositories may not have all metadata fields  
+    • This tool assists validation but does not replace expert review
+    """)
+
+if __name__ == "__main__":
+    main()
