@@ -190,4 +190,83 @@ def similarity_ratio(s1: str, s2: str) -> float:
         return 1.0
     # Simple token-based overlap
     tokens1 = set(re.findall(r'\w+', s1))
-    tokens2 = set(re
+    tokens2 = set(re.findall(r'\w+', s2))
+    if not tokens1 or not tokens2:
+        return 0.0
+    intersection = tokens1 & tokens2
+    union = tokens1 | tokens2
+    return len(intersection) / len(union)
+
+def generate_corrected_entry(original: Dict, verified: Dict, discrepancies: Dict, 
+                            use_llm: bool = False, model_name: str = None) -> Dict:
+    """Generate corrected BibTeX entry, optionally using LLM for refinement"""
+    corrected = original.copy()
+    
+    # Auto-correct fields with high-confidence matches
+    for field, info in discrepancies.items():
+        if info["match"] and verified.get(field):
+            corrected[field] = verified[field]
+        elif info["needs_review"] and not use_llm:
+            # Keep original but flag for review
+            corrected[f"_flag_{field}"] = True
+    
+    # Optional LLM refinement (for ambiguous cases)
+    if use_llm and TRANSFORMERS_AVAILABLE and discrepancies:
+        corrected = llm_refine_metadata(original, verified, discrepancies, model_name)
+    
+    return corrected
+
+def llm_refine_metadata(original: Dict, verified: Dict, discrepancies: Dict, 
+                       model_name: str) -> Dict:
+    """Use small LLM to help resolve metadata conflicts"""
+    if not TRANSFORMERS_AVAILABLE:
+        return {**original, **verified}  # Fallback merge
+    
+    try:
+        # Prepare prompt for LLM
+        prompt = f"""You are a scholarly metadata validator. Compare these two reference entries and output ONLY valid BibTeX author field format.
+
+ORIGINAL:
+{json.dumps(original, indent=2, ensure_ascii=False)}
+
+VERIFIED (from Crossref/OpenAlex):
+{json.dumps(verified, indent=2, ensure_ascii=False)}
+
+DISCREPANCIES:
+{json.dumps({k: v for k, v in discrepancies.items() if v.get('needs_review')}, indent=2)}
+
+Instructions:
+1. Prefer verified data when confidence is high
+2. Format authors as "Last, First and Last, First"
+3. Keep original if verified data is missing or clearly wrong
+4. Output ONLY the corrected BibTeX entry fields that need changes, in valid BibTeX format
+5. Do not add explanations
+
+Corrected fields:"""
+        
+        # Load model (cached after first load)
+        if not hasattr(st, "llm_pipe") or st.session_state.get("current_model") != model_name:
+            with st.spinner(f"🔄 Loading {model_name}..."):
+                if "qwen" in model_name.lower() and "0.5b" in model_name.lower():
+                    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+                elif "gpt2" in model_name.lower() or model_name == "gpt2":
+                    model_id = "gpt2"
+                elif "distilgpt2" in model_name.lower():
+                    model_id = "distilgpt2"
+                else:
+                    model_id = "gpt2"  # Default fallback
+                
+                tokenizer = AutoTokenizer.from_pretrained(model_id)
+                if tokenizer.pad_token is None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id, 
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    device_map="auto" if torch.cuda.is_available() else None
+                )
+                st.session_state.llm_pipe = pipeline(
+                    "text-generation", 
+                    model=model, 
+                    tokenizer=tokenizer,
+                    max_new_tokens=25
