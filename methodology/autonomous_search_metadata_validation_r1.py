@@ -269,4 +269,32 @@ Corrected fields:"""
                     "text-generation", 
                     model=model, 
                     tokenizer=tokenizer,
-                    max_new_tokens=25
+                    max_new_tokens=256,
+                    temperature=0.1,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+                st.session_state.current_model = model_name
+        
+        # Generate refinement
+        result = st.session_state.llm_pipe(prompt)
+        llm_output = result[0]['generated_text'].split("Corrected fields:")[-1].strip()
+        
+        # Parse LLM output (simple key-value extraction)
+        for line in llm_output.split('\n'):
+            if '=' in line and not line.strip().startswith(('%', '@', '{', '}')):
+                key, _, value = line.partition('=')
+                key = key.strip().strip(',').strip()
+                value = value.strip().strip(',').strip('{}"')
+                if key in original:
+                    original[key] = value
+        
+        return original
+        
+    except Exception as e:
+        st.warning(f"⚠️ LLM refinement failed: {e}. Using fallback merge.")
+        return {**original, **verified}  # Safe fallback
+
+def create_bibtex_entry(entry: Dict, cite_key: str) -> str:
+    """Create properly formatted BibTeX entry string"""
+    entry_type = entry.get("_type", "
