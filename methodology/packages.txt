@@ -1,0 +1,5 @@
+tesseract-ocr
+tesseract-ocr-eng
+libtesseract-dev
+libgl1  # For OpenCV
+libgl1-mesa-glx   # for OpenCV
