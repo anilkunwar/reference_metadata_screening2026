@@ -1,36 +1,10 @@
-streamlit
-bibtexparser
-requests
-sentencepiece>=0.1.99  # For Qwen tokenizer
+streamlit>=1.28.0
+bibtexparser>=1.4.0
+requests>=2.31.0
+torch>=2.0.0
+transformers>=4.35.0
+accelerate>=0.24.0
+sentencepiece>=0.1.99
 protobuf>=3.20.0
-matplotlib
-scipy
-plotly
-pyvista
-numba
-meshio
-cupy-cuda12x  # For CUDA 11.x pip install cupy-cuda11x
-imageio
-imageio-ffmpeg
-seaborn
-torch
-torchvision
-h5py
-msgpack
-dill
-joblib
-scikit-learn
-scikit-image
-pandas
-xgboost
-s3fs
-cmasher
-einops
-sentence-transformers
-transformers
-accelerate
-#opencv-python>=4.8.0
-opencv-python-headless
-pillow
-numpy
-pytesseract
+psutil>=5.9.0
+bitsandbytes>=0.41.0  # Optional: for 8-bit quantization
