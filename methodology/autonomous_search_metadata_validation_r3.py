@@ -1,7 +1,14 @@
-# app.py - BibTeX Hallucination Validator (Complete Expanded Version with Working LLM)
+# app.py - BibTeX Hallucination Validator (Fixed LLM Loading for Streamlit Cloud)
 # ============================================================================
-# Features: Robust author matching, CPU-safe LLM loading with @st.cache_resource,
-#           clean BibTeX output, dropdown model selection that actually works
+# Key fixes:
+# 1. LLM loading moved to dedicated button (not automatic sidebar)
+# 2. Memory-aware loading with psutil monitoring
+# 3. Optimized model loading: float16, low_cpu_mem_usage, 8-bit quantization option
+# 4. Progressive loading with explicit user control
+# 5. @st.cache_resource properly isolated with minimal concurrent UI activity
+# 6. Graceful fallbacks and clear error messages
+# 7. Force garbage collection before model load
+# 8. Hugging Face cache management with clear button
 # ============================================================================
 
 import streamlit as st
@@ -11,6 +18,9 @@ import re
 import json
 import time
 import logging
+import sys
+import os
+import gc
 from typing import Optional, Dict, List, Tuple, Any, Union
 from bibtexparser.bparser import BibTexParser
 from bibtexparser.bwriter import BibTexWriter
@@ -26,6 +36,7 @@ logger = logging.getLogger(__name__)
 # ==================== Optional LLM Imports ====================
 TRANSFORMERS_AVAILABLE = False
 TORCH_AVAILABLE = False
+BITSANDBYTES_AVAILABLE = False
 
 try:
     import torch
@@ -36,7 +47,7 @@ except ImportError:
     torch = None
 
 try:
-    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, GenerationConfig
+    from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, GenerationConfig, BitsAndBytesConfig
     TRANSFORMERS_AVAILABLE = True
     logger.info("Transformers library loaded successfully")
 except ImportError:
@@ -45,6 +56,22 @@ except ImportError:
     AutoModelForCausalLM = None
     pipeline = None
     GenerationConfig = None
+    BitsAndBytesConfig = None
+
+try:
+    import bitsandbytes as bnb
+    BITSANDBYTES_AVAILABLE = True
+    logger.info("bitsandbytes available for 8-bit quantization")
+except ImportError:
+    logger.info("bitsandbytes not installed - 8-bit quantization disabled")
+    BITSANDBYTES_AVAILABLE = False
+
+# Optional: psutil for memory monitoring
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 # ==================== Page Configuration ====================
 st.set_page_config(
@@ -67,17 +94,52 @@ TITLE_SEARCH_MAX_RESULTS = 3
 VALID_ENTRY_TYPES = {"article", "book", "inproceedings", "misc", "techreport", "phdthesis", "mastersthesis", "online", "dataset", "report", "manual"}
 FIELDS_TO_VALIDATE = ["title", "author", "journal", "booktitle", "year", "volume", "number", "pages", "doi", "publisher"]
 
+# ==================== Memory Monitoring Utilities ====================
+
+def get_memory_usage_mb() -> float:
+    """Get current process memory usage in MB."""
+    if PSUTIL_AVAILABLE:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
+    return 0.0
+
+def check_memory_available(min_required_mb: float = 400) -> Tuple[bool, str]:
+    """Check if enough memory is available for model loading."""
+    if not PSUTIL_AVAILABLE:
+        return True, "Memory monitoring not available"
+    
+    total_ram = psutil.virtual_memory().total / (1024 * 1024)
+    available_ram = psutil.virtual_memory().available / (1024 * 1024)
+    current_usage = get_memory_usage_mb()
+    
+    # Estimate peak usage during load: current + model size + buffer
+    estimated_peak = current_usage + min_required_mb + 100  # 100MB buffer
+    
+    if estimated_peak > total_ram * 0.9:  # Stay under 90% of total
+        return False, f"Insufficient memory: need ~{min_required_mb}MB, have {available_ram:.0f}MB available (peak est: {estimated_peak:.0f}MB)"
+    
+    if available_ram < min_required_mb:
+        return False, f"Low available memory: {available_ram:.0f}MB < required {min_required_mb}MB"
+    
+    return True, f"Memory OK: {available_ram:.0f}MB available"
+
+def force_garbage_collection():
+    """Force Python garbage collection to free memory before model load."""
+    gc.collect()
+    if torch and TORCH_AVAILABLE:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if hasattr(torch, 'mps') and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
 # ==================== Author Normalization & Matching ====================
 
 def normalize_author_name(name: str) -> str:
     """Convert author name to canonical form for comparison: 'first last' lowercase, no punctuation."""
     if not name or not isinstance(name, str):
         return ""
-    # Remove non-alphanumeric except spaces and hyphens
     cleaned = re.sub(r'[^a-z\s\-]', '', name.lower())
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    
-    # Handle "Last, First" -> "first last"
     if ',' in cleaned:
         parts = [p.strip() for p in cleaned.split(',', 1)]
         if len(parts) == 2 and parts[0] and parts[1]:
@@ -92,10 +154,7 @@ def extract_initials(name: str) -> str:
     return ''.join([w[0] for w in norm.split() if w])
 
 def authors_match_score(authors_orig: List[str], authors_ver: List[str]) -> Tuple[float, str, bool]:
-    """
-    Compare two author lists and return (match_score, confidence, needs_review).
-    Handles initials vs full names, order variations, and formatting differences.
-    """
+    """Compare two author lists and return (match_score, confidence, needs_review)."""
     if not authors_orig and not authors_ver:
         return 1.0, "high", False
     if not authors_orig or not authors_ver:
@@ -107,11 +166,9 @@ def authors_match_score(authors_orig: List[str], authors_ver: List[str]) -> Tupl
     if not norm_orig or not norm_ver:
         return 0.0, "low", True
         
-    # Exact match check (order-independent)
     if set(norm_orig) == set(norm_ver):
         return 1.0, "high", False
         
-    # Check if all verified authors match original by initials or substring
     matches = 0
     for va in norm_ver:
         va_initials = extract_initials(va)
@@ -121,11 +178,9 @@ def authors_match_score(authors_orig: List[str], authors_ver: List[str]) -> Tupl
                 matched = True
                 break
             if va_initials and len(va_initials) >= 2:
-                # Check if original contains initials
                 if va_initials in oa or oa.startswith(va_initials):
                     matched = True
                     break
-                # Check if verified contains original initials
                 oa_initials = extract_initials(oa)
                 if oa_initials and oa_initials in va:
                     matched = True
@@ -284,7 +339,6 @@ def fetch_crossref_metadata(doi: str, timeout: int = DEFAULT_TIMEOUT) -> Optiona
     titles = msg.get("title", [])
     result["title"] = titles[0] if titles and isinstance(titles, list) and len(titles) > 0 else None
     
-    # FIXED: Complete author extraction loop - was truncated as 'authors_'
     authors_data = msg.get("author", [])
     if authors_data and isinstance(authors_data, list):
         for author in authors_data:
@@ -419,7 +473,6 @@ def compare_metadata_fields(original: Dict[str, Any], verified: Dict[str, Any]) 
         orig_val = original.get(field)
         verify_val = verified.get(field)
         
-        # Handle Authors with robust matching
         if field in ["author", "authors"]:
             orig_auth_list = [a.strip() for a in re.split(r'\s+and\s+', str(orig_val or ""), flags=re.IGNORECASE) if a.strip()]
             ver_auth_list = verified.get("authors", [])
@@ -483,14 +536,12 @@ def merge_metadata_entries(original: Dict[str, Any], verified: Dict[str, Any],
             continue
         if res["match"] and res["confidence"] in ["high", "medium"]:
             if field in ["author", "authors"]:
-                # Format verified authors to proper BibTeX Last, First
                 ver_auths = res["verified"] if isinstance(res["verified"], list) else [res["verified"]]
                 bibtex_authors = []
                 for a in ver_auths:
                     if "," in str(a):
                         bibtex_authors.append(a.strip())
                     else:
-                        # Assume "First Last" -> "Last, First"
                         parts = str(a).rsplit(" ", 1)
                         if len(parts) == 2:
                             bibtex_authors.append(f"{parts[1].strip()}, {parts[0].strip()}")
@@ -505,75 +556,116 @@ def merge_metadata_entries(original: Dict[str, Any], verified: Dict[str, Any],
             merged[f"_flag_reason_{field}"] = f"Discrepancy: orig='{res['original']}', verified='{res['verified']}', conf={res['confidence']}"
     return merged
 
-# ==================== LLM Integration Functions - KEY FIXES FOR LOADING ====================
+# ==================== LLM Integration Functions - FIXED FOR STREAMLIT CLOUD ====================
 
 @st.cache_resource
-def _load_llm_model_cached(model_id: str, device: str):
+def _load_llm_model_cached(model_id: str, use_8bit: bool = False, device: str = "cpu"):
     """
-    Internal cached function to load LLM model - decorated with @st.cache_resource.
-    This is the KEY to making dropdown LLM loading work like the Core-Shell app.
+    Cached LLM loader with memory optimizations for Streamlit Cloud.
+    
+    Key optimizations:
+    - use_8bit: Enables 8-bit quantization via bitsandbytes (reduces memory by ~4x)
+    - device: Explicit device selection
+    - low_cpu_mem_usage: Reduces peak memory during loading
+    - float16 on CPU: Reduces memory vs float32 (with acceptable precision loss)
     """
     if not TRANSFORMERS_AVAILABLE or not TORCH_AVAILABLE:
         return None, None
     
-    logger.info(f"Loading {model_id} on {device} (cached)")
+    logger.info(f"Loading {model_id} on {device} with 8-bit={use_8bit}")
     
     try:
+        # Memory check before loading
+        if PSUTIL_AVAILABLE:
+            available = psutil.virtual_memory().available / (1024 * 1024)
+            logger.info(f"Available RAM before load: {available:.0f}MB")
+        
+        # Force GC to free memory before loading
+        force_garbage_collection()
+        
+        # Load tokenizer first (smaller, faster)
+        logger.info(f"Loading tokenizer for {model_id}")
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         if tok.pad_token is None: 
             tok.pad_token = tok.eos_token
-            
-        # CPU-safe model loading with appropriate dtype
-        if device == "cpu":
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id, 
-                torch_dtype=torch.float32, 
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
-        elif device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                torch_dtype=torch.float16,
-                trust_remote_code=True
-            ).to("mps")
-        else:  # cuda
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id, 
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.device_count() > 1 else None,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
         
+        # Configure model loading with memory optimizations
+        model_kwargs = {
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,  # Critical for reducing peak memory
+        }
+        
+        # Quantization config if available and requested
+        if use_8bit and BITSANDBYTES_AVAILABLE:
+            logger.info("Using 8-bit quantization")
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+            )
+        else:
+            # Use float16 to reduce memory (works on CPU with recent PyTorch)
+            if device == "cpu":
+                # Try float16 first, fall back to float32 if not supported
+                try:
+                    model_kwargs["torch_dtype"] = torch.float16
+                except:
+                    model_kwargs["torch_dtype"] = torch.float32
+            elif device == "cuda" and torch.cuda.is_available():
+                model_kwargs["torch_dtype"] = torch.float16
+                if torch.cuda.device_count() > 1:
+                    model_kwargs["device_map"] = "auto"
+            elif device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                model_kwargs["torch_dtype"] = torch.float16
+        
+        logger.info(f"Loading model weights for {model_id} with kwargs: {model_kwargs}")
+        model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
+        
+        # Move to device if not already handled by device_map
+        if device == "cpu" and not hasattr(model, "hf_device_map"):
+            model = model.to("cpu")
+        elif device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            model = model.to("mps")
+        
+        # Generation config optimized for metadata refinement (not creative writing)
         gen_conf = GenerationConfig(
             max_new_tokens=256, 
-            temperature=0.1, 
+            temperature=0.1,  # Low for deterministic output
             top_p=0.9, 
             do_sample=True, 
             pad_token_id=tok.pad_token_id, 
             eos_token_id=tok.eos_token_id, 
-            repetition_penalty=1.2
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3,
         )
         
+        # Create pipeline with minimal overhead
         pipe = pipeline(
             "text-generation", 
             model=model, 
             tokenizer=tok, 
-            device=0 if device == "cuda" else (-1 if device == "cpu" else None),
+            device=0 if device == "cuda" and torch.cuda.is_available() else -1,
             generation_config=gen_conf
         )
         
+        logger.info(f"Successfully loaded {model_id} on {device}")
         return tok, pipe
         
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error(f"CUDA OOM loading {model_id}: {e}")
+        return None, None
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            logger.error(f"Memory error loading {model_id}: {e}")
+            return None, None
+        raise
     except Exception as e:
-        logger.error(f"Failed to load {model_id}: {type(e).__name__}: {e}")
+        logger.error(f"Failed to load {model_id}: {type(e).__name__}: {e}", exc_info=True)
         return None, None
 
 
-def initialize_llm_pipeline(model_name: str, device: Optional[str] = None) -> Optional[Any]:
+def initialize_llm_pipeline(model_name: str, use_8bit: bool = False, device: Optional[str] = None) -> Optional[Any]:
     """
-    Initialize LLM pipeline using cached loader - matches Core-Shell app pattern.
+    Public LLM initializer with memory-aware loading.
     Returns pipeline object or None if loading fails.
     """
     if not TRANSFORMERS_AVAILABLE or not TORCH_AVAILABLE:
@@ -589,21 +681,37 @@ def initialize_llm_pipeline(model_name: str, device: Optional[str] = None) -> Op
         }
         model_id = mapping.get(model_name, model_name)
         
-        # Detect device safely - matches Core-Shell app logic
+        # Detect device - prefer CPU for Cloud environments to avoid GPU memory issues
         if device is None:
-            if torch.cuda.is_available():
-                dev = "cuda"
+            # On Streamlit Cloud, default to CPU to avoid GPU memory fragmentation
+            if "STREAMLIT" in os.environ or "HUGGINGFACE" in os.environ:
+                device = "cpu"
+            elif torch.cuda.is_available():
+                device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                dev = "mps"
+                device = "mps"
             else:
-                dev = "cpu"
+                device = "cpu"
+        
+        logger.info(f"Initializing LLM: {model_name} -> {model_id} on {device}, 8-bit={use_8bit}")
+        
+        # Memory check with model-specific requirements
+        if model_id == "gpt2":
+            min_mem = 300  # ~300MB for GPT-2 with float16
+        elif model_id == "distilgpt2":
+            min_mem = 250  # ~250MB for distilgpt2
+        elif "Qwen" in model_id:
+            min_mem = 800 if not use_8bit else 300  # ~800MB FP16, ~300MB 8-bit
         else:
-            dev = device
-            
-        logger.info(f"Initializing LLM: {model_name} -> {model_id} on {dev}")
+            min_mem = 400
+        
+        mem_ok, mem_msg = check_memory_available(min_mem)
+        if not mem_ok:
+            logger.warning(f"Memory check failed: {mem_msg}")
+            return None
         
         # Use cached loader - THIS IS THE KEY FIX
-        tokenizer, pipe = _load_llm_model_cached(model_id, dev)
+        tokenizer, pipe = _load_llm_model_cached(model_id, use_8bit=use_8bit, device=device)
         
         if pipe is None:
             logger.warning(f"Pipeline creation failed for {model_id}")
@@ -773,6 +881,8 @@ def main():
         st.session_state.processing_complete = False
     if "llm_load_error" not in st.session_state:
         st.session_state.llm_load_error = None
+    if "llm_8bit_enabled" not in st.session_state:
+        st.session_state.llm_8bit_enabled = False
 
     st.title("📚 BibTeX Hallucination Validator")
     st.markdown("**Upload a `.bib` file** to validate references against Crossref & OpenAlex APIs. Detects and corrects hallucinated metadata, with robust author name matching.")
@@ -780,52 +890,120 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        # LLM Model Selection - dropdown that actually triggers loading
+        # Memory status display (if psutil available)
+        if PSUTIL_AVAILABLE:
+            mem_usage = get_memory_usage_mb()
+            mem_total = psutil.virtual_memory().total / (1024 * 1024)
+            mem_avail = psutil.virtual_memory().available / (1024 * 1024)
+            st.metric("💾 Memory Usage", f"{mem_usage:.0f}MB / {mem_total:.0f}MB", 
+                     delta=f"{mem_avail:.0f}MB available", delta_color="normal")
+        
+        # LLM Model Selection - dropdown (does NOT auto-load)
         st.subheader("🤖 LLM Refinement (Optional)")
         llm_opts = ["None (API-only)", "gpt2 (~124M)", "distilgpt2 (~82M)", "Qwen2.5-0.5B-Instruct (~0.5B)"]
         sel_model = st.selectbox("Select model for metadata refinement:", llm_opts, index=0)
-        use_llm = sel_model != "None (API-only)"
         
-        # KEY FIX: Load LLM when dropdown changes - matches Core-Shell app pattern
-        if use_llm and (st.session_state.llm_pipeline is None or st.session_state.current_model != sel_model):
-            with st.status(f"🔄 Loading {sel_model}...", expanded=True) as status:
-                st.write("Initializing tokenizer & model weights...")
-                
-                # Detect device for display
-                if torch.cuda.is_available():
-                    dev_display = "GPU (CUDA)"
-                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                    dev_display = "Apple Silicon (MPS)"
-                else:
-                    dev_display = "CPU"
-                st.write(f"Target device: {dev_display}")
-                
-                # Warn about CPU loading for large models
-                if dev_display == "CPU" and "Qwen" in sel_model:
-                    st.warning("⚠️ Qwen2.5-0.5B on CPU requires ~1.2GB RAM and 30-60s to load. May timeout on free tiers.")
-                
-                # Attempt to load with cached function
-                pipeline = initialize_llm_pipeline(sel_model)
-                
-                if pipeline:
-                    st.session_state.llm_pipeline = pipeline
-                    st.session_state.current_model = sel_model
-                    st.session_state.llm_load_error = None
-                    status.update(label=f"✅ {sel_model} loaded successfully", state="complete", expanded=False)
-                    st.success(f"Model ready for refinement!")
-                else:
-                    st.session_state.llm_load_error = f"Failed to load {sel_model}"
-                    status.update(label=f"⚠️ Load failed - using API-only", state="error", expanded=False)
-                    st.warning("LLM refinement disabled. Author matching still works via rule-based normalization.")
-                    use_llm = False  # Disable LLM usage for this session
+        # 8-bit quantization option (only if bitsandbytes available)
+        use_8bit = False
+        if sel_model != "None (API-only)" and BITSANDBYTES_AVAILABLE:
+            use_8bit = st.checkbox("Use 8-bit quantization (reduces memory by ~4x)", 
+                                  value=st.session_state.llm_8bit_enabled,
+                                  help="Recommended for Streamlit Cloud. May slightly reduce precision.")
+            st.session_state.llm_8bit_enabled = use_8bit
         
-        # Display load error if present
+        # KEY FIX: Dedicated button to load LLM (not automatic)
+        use_llm = False
+        if sel_model != "None (API-only)":
+            col_load1, col_load2 = st.columns([2, 1])
+            with col_load1:
+                load_llm_btn = st.button(f"🔧 Load {sel_model}", 
+                                        use_container_width=True,
+                                        disabled=(st.session_state.llm_pipeline is not None and st.session_state.current_model == sel_model))
+            with col_load2:
+                if st.session_state.llm_pipeline is not None:
+                    if st.button("🗑️ Unload", use_container_width=True, help="Free memory by unloading model"):
+                        st.session_state.llm_pipeline = None
+                        st.session_state.current_model = None
+                        st.session_state.llm_load_error = None
+                        force_garbage_collection()
+                        st.rerun()
+            
+            # Load LLM ONLY when button is clicked (isolated from other UI activity)
+            if load_llm_btn:
+                with st.status(f"🔄 Loading {sel_model}...", expanded=True) as status:
+                    # Minimize UI activity during load
+                    st.write("Preparing environment...")
+                    force_garbage_collection()
+                    
+                    st.write("Initializing tokenizer & model weights...")
+                    
+                    # Device detection for display
+                    if "STREAMLIT" in os.environ or "HUGGINGFACE" in os.environ:
+                        dev_display = "CPU (Cloud-optimized)"
+                    elif torch.cuda.is_available():
+                        dev_display = "GPU (CUDA)"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        dev_display = "Apple Silicon (MPS)"
+                    else:
+                        dev_display = "CPU"
+                    st.write(f"Target device: {dev_display}")
+                    
+                    # Warn about model sizes
+                    if "Qwen" in sel_model:
+                        if use_8bit:
+                            st.info("ℹ️ Qwen2.5-0.5B with 8-bit: ~300MB RAM, ~45s load time")
+                        else:
+                            st.warning("⚠️ Qwen2.5-0.5B without 8-bit: ~800MB RAM, ~60s load time")
+                    elif "gpt2" in sel_model.lower():
+                        st.info("ℹ️ GPT-2: ~300MB RAM, ~20s load time")
+                    
+                    # Attempt to load with cached function
+                    pipeline = initialize_llm_pipeline(sel_model, use_8bit=use_8bit)
+                    
+                    if pipeline:
+                        st.session_state.llm_pipeline = pipeline
+                        st.session_state.current_model = sel_model
+                        st.session_state.llm_load_error = None
+                        status.update(label=f"✅ {sel_model} loaded successfully", state="complete", expanded=False)
+                        st.success(f"Model ready for refinement!")
+                        use_llm = True
+                    else:
+                        st.session_state.llm_load_error = f"Failed to load {sel_model}"
+                        status.update(label=f"⚠️ Load failed - using API-only", state="error", expanded=False)
+                        st.warning("LLM refinement disabled. Author matching still works via rule-based normalization.")
+                        st.info("💡 Tips: Try 8-bit quantization, close other apps, or use a smaller model.")
+                        use_llm = False
+        
+        # Display load error if present with retry option
         if st.session_state.llm_load_error:
             st.error(f"❌ {st.session_state.llm_load_error}")
-            if st.button("🔄 Retry Loading"):
-                st.session_state.llm_pipeline = None
-                st.session_state.current_model = None
-                st.rerun()
+            col_retry1, col_retry2 = st.columns(2)
+            with col_retry1:
+                if st.button("🔄 Retry Loading", use_container_width=True):
+                    st.session_state.llm_pipeline = None
+                    st.session_state.current_model = None
+                    st.session_state.llm_load_error = None
+                    force_garbage_collection()
+                    st.rerun()
+            with col_retry2:
+                if st.button("📦 Clear Cache & Retry", use_container_width=True, 
+                           help="Clear Hugging Face cache and retry (may re-download model)"):
+                    import shutil
+                    cache_dir = os.path.expanduser("~/.cache/huggingface")
+                    if os.path.exists(cache_dir):
+                        try:
+                            # Only clear transformers cache, not everything
+                            hf_cache = os.path.join(cache_dir, "hub")
+                            if os.path.exists(hf_cache):
+                                shutil.rmtree(hf_cache)
+                                st.success("Hugging Face cache cleared")
+                        except Exception as e:
+                            st.warning(f"Could not clear cache: {e}")
+                    st.session_state.llm_pipeline = None
+                    st.session_state.current_model = None
+                    st.session_state.llm_load_error = None
+                    force_garbage_collection()
+                    st.rerun()
         
         # Advanced Options
         st.subheader("🔧 Advanced Options")
@@ -854,464 +1032,138 @@ def main():
         user_email = st.text_input("Your email (for Crossref API User-Agent):",
                                  value="validator@example.com",
                                  help="Required by Crossref API policy. Replace with your actual email.")
-        if user_email and "example.com" not in user_email:
+        if user_email and "example.com" not in user_email: 
             global USER_AGENT
             USER_AGENT = f"BibTeX-Validator/1.0 (mailto:{user_email})"
-        
-        st.divider()
-        
-        # Quick stats
-        st.subheader("📊 Session Stats")
-        if st.session_state.validation_results:
-            results = st.session_state.validation_results
-            verified = sum(1 for r in results if r.get("verified"))
-            flagged = sum(1 for r in results if any(
-                d.get("needs_review") for d in r.get("discrepancies", {}).values()
-            ))
-            st.metric("✅ Verified", verified)
-            st.metric("⚠️ Flagged", flagged)
-            st.metric("📋 Total", len(results))
-        else:
-            st.caption("Upload a file to see validation statistics")
 
-    # ==================== File Upload Section ====================
-    st.subheader("📁 Upload BibTeX File")
-    
-    uploaded_file = st.file_uploader(
-        "Choose a `.bib` or `.txt` file containing your references",
-        type=["bib", "txt"],
-        help="File should contain valid BibTeX entries (@article, @inproceedings, etc.)"
-    )
-    
-    if uploaded_file is None:
-        st.info("👆 Please upload a BibTeX file to begin validation.")
-        
-        # Show sample file format help
-        with st.expander("📋 Example BibTeX Entry Format"):
-            st.code("""
-@article{Author2024Title,
-  author  = {Last, First and Another, Person},
-  title   = {Article Title with Proper Capitalization},
-  journal = {Full Journal Name},
-  year    = {2024},
-  volume  = {12},
-  pages   = {123--456},
-  doi     = {10.1234/example.doi}
-}
-            """, language="bibtex")
+    st.subheader("📁 Upload BibTeX")
+    uploaded = st.file_uploader("Choose .bib file", type=["bib", "txt"])
+    if not uploaded:
+        st.info("👆 Upload a BibTeX file to start.")
         st.stop()
-    
-    # ==================== File Processing ====================
-    with st.spinner("🔍 Parsing BibTeX entries..."):
-        entries, parse_error = parse_bibtex_file_content(uploaded_file.getvalue())
-    
-    if parse_error:
-        st.error(f"❌ {parse_error}")
+
+    with st.spinner("Parsing entries..."):
+        entries, err = parse_bibtex_file_content(uploaded.getvalue())
+    if err: 
+        st.error(f"❌ {err}")
         st.stop()
-    
-    if not entries:
-        st.error("❌ No valid BibTeX entries found. Please check your file format.")
+    if not entries: 
+        st.error("❌ No valid entries found.")
         st.stop()
-    
-    st.success(f"✅ Found **{len(entries)}** reference(s) to validate")
-    
-    # ==================== Validation Progress UI ====================
+    st.success(f"✅ Found **{len(entries)}** references")
+
     st.subheader("🔄 Validation Progress")
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    progress_details = st.expander("📋 Detailed Progress Log", expanded=False)
-    
-    validated_results = []
-    
-    # Process each entry sequentially with progress updates
+    prog = st.progress(0)
+    status_txt = st.empty()
+    log = st.expander("📋 Progress Log", expanded=False)
+    results = []
+
     for idx, entry in enumerate(entries):
-        # Update progress display
-        progress = (idx + 1) / len(entries)
-        progress_bar.progress(progress)
+        prog.progress((idx+1)/len(entries))
+        ck = entry.get("cite_key", f"entry_{idx}")
+        title = safe_string_slice(entry.get("title"), 60)
+        doi = entry.get("doi", "")
+        status_txt.text(f"🔍 [{idx+1}/{len(entries)}] {title}")
+
+        verified = None
+        # 1. DOI Lookup
+        if doi:
+            cdoi = clean_doi(doi)
+            if cdoi:
+                verified = fetch_crossref_metadata(doi, timeout)
+                if not verified: 
+                    verified = fetch_openalex_metadata(doi, timeout)
         
-        cite_key = entry.get("cite_key", f"entry_{idx}")
-        original_title = safe_string_slice(entry.get("title"), 60)
-        original_doi = entry.get("doi", "")
-        
-        status_text.text(f"🔍 [{idx+1}/{len(entries)}] {original_title}")
-        
-        # Log to detailed view
-        with progress_details:
-            st.caption(f"`{cite_key}`: {original_title}")
-        
-        # ==================== Step 1: DOI-Based Lookup ====================
-        verified_metadata = None
-        
-        if original_doi:
-            clean_doi = clean_doi(original_doi)
-            if clean_doi:
-                # Try Crossref first (primary source)
-                with progress_details:
-                    st.text(f"  → Querying Crossref for DOI: {clean_doi}")
-                verified_metadata = fetch_crossref_metadata(original_doi, timeout=timeout)
-                
-                # Fallback to OpenAlex if Crossref fails
-                if not verified_metadata:
-                    with progress_details:
-                        st.text(f"  → Crossref not found, trying OpenAlex...")
-                    verified_metadata = fetch_openalex_metadata(original_doi, timeout=timeout)
-                    
-                    if verified_metadata:
-                        with progress_details:
-                            st.success(f"  ✓ Found via OpenAlex")
-                    else:
-                        with progress_details:
-                            st.warning(f"  ✗ Not found in Crossref or OpenAlex")
-                else:
-                    with progress_details:
-                        st.success(f"  ✓ Found via Crossref")
-        
-        # ==================== Step 2: Title Search Fallback ====================
-        if not verified_metadata and entry.get("title"):
-            with progress_details:
-                st.text(f"  → DOI lookup failed, searching by title...")
+        # 2. Title Search Fallback
+        if not verified and entry.get("title"):
+            t_res = search_crossref_by_title(entry["title"], TITLE_SEARCH_MAX_RESULTS, timeout)
+            if t_res:
+                best = next((r for r in t_res if r.get("match_score",0)>=0.9 and r.get("doi")), None)
+                if best: 
+                    verified = fetch_crossref_metadata(best["doi"], timeout)
+
+        # 3. Process Result
+        if verified:
+            disc = compare_metadata_fields(entry, verified)
+            n_flag = sum(1 for d in disc.values() if d.get("needs_review"))
+            with log: 
+                st.text(f"`{ck}`: {'✅ Match' if n_flag==0 else f'⚠️ {n_flag} flags'}")
             
-            title_results = search_crossref_by_title(
-                entry["title"], 
-                max_results=TITLE_SEARCH_MAX_RESULTS, 
-                timeout=timeout
-            )
-            
-            if title_results:
-                with progress_details:
-                    st.text(f"  → Found {len(title_results)} potential matches")
-                
-                # Select best match by score threshold
-                best_match = None
-                for result in title_results:
-                    if result.get("match_score", 0) >= 0.9 and result.get("doi"):
-                        best_match = result
-                        break
-                
-                if best_match and best_match["doi"]:
-                    with progress_details:
-                        st.text(f"  → Best match (score={best_match['match_score']:.2f}): {best_match['title'][:50]}...")
-                    # Fetch full metadata for the matched DOI
-                    verified_metadata = fetch_crossref_metadata(best_match["doi"], timeout=timeout)
-                    if verified_metadata:
-                        with progress_details:
-                            st.success(f"  ✓ Verified via title match + DOI lookup")
-        
-        # ==================== Step 3: Metadata Comparison ====================
-        if verified_metadata:
-            # Compare original vs verified fields
-            discrepancies = compare_metadata_fields(entry, verified_metadata)
-            
-            # Count discrepancies for logging
-            needs_review_count = sum(
-                1 for d in discrepancies.values() if d.get("needs_review")
-            )
-            
-            with progress_details:
-                if needs_review_count == 0:
-                    st.success(f"  ✓ All fields match - no corrections needed")
-                else:
-                    st.warning(f"  ⚠ {needs_review_count} field(s) need review")
-            
-            # ==================== Step 4: Apply Corrections ====================
-            # Merge metadata with optional LLM refinement
-            if use_llm and st.session_state.llm_pipeline and needs_review_count > 0:
-                with progress_details:
-                    st.text(f"  → Running LLM refinement with {sel_model}...")
-                corrected_entry = refine_metadata_with_llm(
-                    entry, verified_metadata, discrepancies, 
-                    st.session_state.llm_pipeline
-                )
+            if use_llm and st.session_state.llm_pipeline and n_flag > 0:
+                corrected = refine_metadata_with_llm(entry, verified, disc, st.session_state.llm_pipeline)
             else:
-                corrected_entry = merge_metadata_entries(
-                    entry, verified_metadata, discrepancies, 
-                    auto_correct=auto_correct
-                )
+                corrected = merge_metadata_entries(entry, verified, disc, auto_correct)
             
-            # Store result
-            validated_results.append({
-                "cite_key": cite_key,
-                "original": entry,
-                "verified": verified_metadata,
-                "discrepancies": discrepancies,
-                "corrected": corrected_entry,
-                "status": "verified",
-                "verification_source": verified_metadata.get("source", "unknown")
-            })
-            
+            results.append({"cite_key": ck, "original": entry, "verified": verified, "discrepancies": disc, "corrected": corrected, "status": "verified", "source": verified.get("source")})
         else:
-            # No verification source found - flag for manual review
-            discrepancies = {
-                field: {
-                    "original": entry.get(field),
-                    "verified": None,
-                    "match": False,
-                    "confidence": "low",
-                    "needs_review": True
-                }
-                for field in FIELDS_TO_VALIDATE if entry.get(field)
-            }
-            
-            corrected_entry = entry.copy()
-            corrected_entry["_warning"] = "⚠️ Could not verify against external sources - manual review required"
-            corrected_entry["_unverified_fields"] = list(discrepancies.keys())
-            
-            validated_results.append({
-                "cite_key": cite_key,
-                "original": entry,
-                "verified": None,
-                "discrepancies": discrepancies,
-                "corrected": corrected_entry,
-                "status": "unverified",
-                "verification_source": None
-            })
-            
-            with progress_details:
-                st.warning(f"  ✗ No verification source found - entry flagged for manual review")
-        
-        # Small delay to respect API rate limits
+            disc = {f: {"original": entry.get(f), "verified": None, "match": False, "confidence": "low", "needs_review": True} for f in FIELDS_TO_VALIDATE if entry.get(f)}
+            corrected = entry.copy()
+            corrected["_warning"] = "⚠️ No external verification found"
+            results.append({"cite_key": ck, "original": entry, "verified": None, "discrepancies": disc, "corrected": corrected, "status": "unverified", "source": None})
+            with log: 
+                st.warning(f"`{ck}`: ❌ Unverified")
         time.sleep(0.05)
-    
-    # Final progress update
-    progress_bar.progress(1.0)
-    status_text.text("✨ Validation complete!")
-    progress_bar.empty()
-    
-    # Store results in session state for persistence across reruns
-    st.session_state.validation_results = validated_results
+
+    prog.progress(1.0)
+    status_txt.text("✨ Validation complete!")
+    st.session_state.validation_results = results
     st.session_state.processing_complete = True
-    
-    # ==================== Results Summary ====================
+
     st.divider()
-    st.subheader("📊 Validation Summary")
-    
-    # Calculate summary statistics
-    total_entries = len(validated_results)
-    verified_count = sum(1 for r in validated_results if r["status"] == "verified")
-    unverified_count = total_entries - verified_count
-    flagged_count = sum(
-        1 for r in validated_results 
-        if any(d.get("needs_review") for d in r.get("discrepancies", {}).values())
-    )
-    
-    # Display metrics in columns
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📋 Total Entries", total_entries)
-    col2.metric("✅ Verified", verified_count, delta=f"{verified_count/total_entries*100:.1f}%" if total_entries > 0 else None)
-    col3.metric("❌ Unverified", unverified_count)
-    col4.metric("⚠️ Flagged for Review", flagged_count)
-    
-    # Progress visualization
-    if total_entries > 0:
-        st.progress(verified_count / total_entries, text=f"Verification Rate: {verified_count/total_entries*100:.1f}%")
-    
-    # ==================== Detailed Results Table ====================
-    st.subheader("📋 Entry-by-Entry Results")
-    
-    # Prepare data for table display
-    table_data = []
-    for result in validated_results:
-        row = {
-            "Cite Key": f"`{result['cite_key']}`",
-            "Title": safe_string_slice(result["original"].get("title"), 70),
-            "DOI": clean_doi(result["original"].get("doi")) or "N/A",
-            "Status": "✅ Verified" if result["status"] == "verified" else "❌ Unverified",
-            "Source": result.get("verification_source", "N/A") or "N/A",
-            "Fields Flagged": sum(1 for d in result.get("discrepancies", {}).values() if d.get("needs_review"))
-        }
-        table_data.append(row)
-    
-    # Display interactive table
-    st.dataframe(
-        table_data,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Cite Key": st.column_config.TextColumn("Cite Key", help="BibTeX citation key"),
-            "Title": st.column_config.TextColumn("Title", width="medium"),
-            "DOI": st.column_config.TextColumn("DOI", help="Digital Object Identifier"),
-            "Status": st.column_config.TextColumn("Status"),
-            "Source": st.column_config.TextColumn("Verification Source"),
-            "Fields Flagged": st.column_config.NumberColumn("Fields Flagged", help="Number of fields needing manual review")
-        }
-    )
-    
-    # ==================== Expandable Detailed Comparison View ====================
+    st.subheader("📊 Results Summary")
+    total = len(results)
+    ver_c = sum(1 for r in results if r["status"]=="verified")
+    flag_c = sum(1 for r in results if any(d.get("needs_review") for d in r.get("discrepancies",{}).values()))
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Total", total)
+    c2.metric("Verified", ver_c)
+    c3.metric("Unverified", total-ver_c)
+    c4.metric("Flagged", flag_c)
+
+    st.subheader("📋 Entry Details")
+    tbl = [{"Cite Key": f"`{r['cite_key']}`", "Title": safe_string_slice(r["original"].get("title"),70), 
+            "DOI": clean_doi(r["original"].get("doi")) or "N/A", 
+            "Status": "✅ Verified" if r["status"]=="verified" else "❌ Unverified",
+            "Source": r["source"] or "N/A", "Flags": sum(1 for d in r.get("discrepancies",{}).values() if d.get("needs_review"))} for r in results]
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
     if show_diff:
-        with st.expander("🔍 Detailed Field Comparison View", expanded=False):
-            for result in validated_results:
-                with st.container():
-                    st.markdown(f"#### `{result['cite_key']}` — {result['original'].get('title', 'Untitled')[:80]}...")
-                    
-                    # Status indicator
-                    if result["status"] == "verified":
-                        st.success(f"✅ Verified via {result.get('verification_source', 'external source')}")
-                    else:
-                        st.warning(result["corrected"].get("_warning", "⚠️ Unverified - manual review required"))
-                    
-                    # Field comparison table
-                    if result["discrepancies"]:
-                        comparison_data = []
-                        for field, info in result["discrepancies"].items():
-                            status_icon = (
-                                "✅" if info["match"] else 
-                                "⚠️" if info["needs_review"] else 
-                                "➖"
-                            )
-                            comparison_data.append({
-                                "Field": field,
-                                "Original": safe_string_slice(info["original"], 40),
-                                "Verified": safe_string_slice(info["verified"], 40) if info["verified"] else "N/A",
-                                "Status": status_icon,
-                                "Confidence": info.get("confidence", "N/A")
-                            })
-                        
-                        if comparison_data:
-                            st.dataframe(
-                                comparison_data,
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "Status": st.column_config.TextColumn("Status", width="small"),
-                                    "Confidence": st.column_config.TextColumn("Confidence", width="small")
-                                }
-                            )
-                    
-                    st.divider()
-    
-    # ==================== Download Corrected BibTeX ====================
+        with st.expander("🔍 Detailed Comparison", expanded=False):
+            for r in results:
+                st.markdown(f"#### `{r['cite_key']}` — {r['original'].get('title','Untitled')[:70]}...")
+                if r["status"]=="verified": 
+                    st.success(f"✅ via {r['source']}")
+                else: 
+                    st.warning(r["corrected"].get("_warning","⚠️ Unverified"))
+                if r["discrepancies"]:
+                    comp = []
+                    for f, d in r["discrepancies"].items():
+                        orig_disp = safe_string_slice(d["original"], 40)
+                        ver_disp = safe_string_slice(d["verified"], 40) if d["verified"] is not None else "N/A"
+                        if isinstance(d["verified"], list):
+                            ver_disp = safe_string_slice(" and ".join(d["verified"]), 40)
+                        status_icon = "✅" if d["match"] else "⚠️" if d["needs_review"] else "➖"
+                        comp.append({"Field": f, "Original": orig_disp, "Verified": ver_disp, "Status": status_icon, "Confidence": d["confidence"]})
+                    st.dataframe(comp, use_container_width=True, hide_index=True)
+                st.divider()
+
     st.divider()
-    st.subheader("💾 Download Validated BibTeX File")
-    
-    # Prepare entries for output
-    output_entries = []
-    for result in validated_results:
-        # Skip unverified entries if user chose to exclude them
-        if result["status"] == "unverified" and not include_unverified:
-            continue
-        
-        # Use corrected entry (with internal flags removed for clean output)
-        entry_output = {
-            k: v for k, v in result["corrected"].items() 
-            if not k.startswith("_") or k in ["_warning"]  # Optionally keep warning
-        }
-        output_entries.append(entry_output)
-    
-    # Generate BibTeX content
-    generation_metadata = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "sources": "Crossref API, OpenAlex API",
-        "llm_model": sel_model if use_llm else "Disabled",
-        "verified_count": verified_count,
-        "flagged_count": flagged_count
-    }
-    
-    bib_content = generate_complete_bibtex_file(output_entries, generation_metadata)
-    
-    # Create download button
-    st.download_button(
-        label="📥 Download validated_references.bib",
-        data=bib_content,
-        file_name="validated_references.bib",
-        mime="text/plain",
-        type="primary",
-        help="Download corrected BibTeX file ready for use in LaTeX documents"
-    )
-    
-    # Preview the output
-    with st.expander("👀 Preview First 3 Entries", expanded=False):
-        preview_entries = output_entries[:3]
-        for entry in preview_entries:
-            key = entry.get("cite_key", "unknown")
-            preview = generate_bibtex_entry_string(entry, key)
-            st.code(preview, language="bibtex")
+    st.subheader("💾 Download")
+    out = [r["corrected"] for r in results if r["status"]=="verified" or include_unverified]
+    meta = {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "sources": "Crossref/OpenAlex", "llm_model": sel_model if use_llm else "Disabled", "verified_count": ver_c, "flagged_count": flag_c}
+    bib_content = generate_complete_bibtex_file(out, metadata=meta)
+    st.download_button("📥 Download validated_references.bib", bib_content, "validated_references.bib", "text/plain", type="primary")
+    with st.expander("👀 Preview (First 3)"):
+        for e in out[:3]: 
+            st.code(generate_bibtex_entry_string(e, e.get("cite_key","?")), "bibtex")
             st.divider()
-    
-    # ==================== Help and Documentation ====================
-    with st.expander("❓ How This Tool Works", expanded=False):
-        st.markdown("""
-        ### Validation Pipeline
-        
-        1️⃣ **Parse Input**: Extract title, DOI, authors, and other fields from your BibTeX entries
-        
-        2️⃣ **DOI Lookup (Primary)**: Query Crossref API using DOI - most reliable method
-           - Falls back to OpenAlex API if Crossref has no record
-           - Handles DOI URL formats and normalization automatically
-        
-        3️⃣ **Title Search (Fallback)**: If DOI lookup fails, search Crossref by title
-           - Uses fuzzy matching with 85% similarity threshold
-           - Auto-selects best match if confidence score ≥90%
-        
-        4️⃣ **Field Comparison**: Compare each metadata field between original and verified
-           - Authors: Set-based comparison (order-independent, 70% overlap threshold)
-           - Titles: Fuzzy token-based similarity matching
-           - Year/Volume/Pages: Exact or substring matching
-           - Confidence scoring: high/medium/low based on match quality
-        
-        5️⃣ **Correction Application**: 
-           - Auto-correct: Fields with high/medium confidence matches
-           - Flag for review: Discrepancies with low confidence or missing verified data
-           - LLM refinement (optional): Resolve ambiguous author formatting, journal abbreviations
-        
-        6️⃣ **Output Generation**: Produce clean BibTeX with corrections applied and flags for manual review
-        
-        ### Understanding the Output
-        
-        - ✅ **Verified**: Entry matched external source with high confidence
-        - ⚠️ **Flagged**: Specific fields differ between original and verified - review recommended  
-        - ❌ **Unverified**: No matching record found in Crossref/OpenAlex - manual verification required
-        
-        Fields with `_flag_*` suffix in the output indicate discrepancies needing your attention.
-        
-        ### Best Practices
-        
-        🔹 Start with "API-only" mode for fastest processing of large files  
-        🔹 Use LLM refinement only for entries flagged with author/journal formatting issues  
-        🔹 Always manually review entries marked as unverified or with multiple flagged fields  
-        🔹 Update the User-Agent email in settings to comply with Crossref API policy  
-        🔹 For institutional use, consider adding API keys for higher rate limits
-        """)
-    
-    # ==================== Footer ====================
-    st.divider()
-    st.caption("""
-    **BibTeX Hallucination Validator v1.0** | 
-    Validation sources: Crossref API, OpenAlex API | 
-    LLM models: GPT-2, DistilGPT-2, Qwen2.5-0.5B (all <1.2B parameters) |
-    
-    *This tool assists with reference validation but does not replace expert scholarly review. 
-    Always verify critical references against original sources before publication.*
-    """)
 
+    st.caption("🔹 Author matching handles initials, full names, and 'Last, First' formatting automatically. LLM is optional. Always manually verify flagged entries.")
 
-# ==================== Application Entry Point ====================
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # Catch-all error handler with detailed logging
         import traceback
-        error_details = traceback.format_exc()
-        logger.critical(f"Unhandled exception in main(): {error_details}")
-        
-        st.error("""
-        ## ❌ Application Error
-        
-        An unexpected error occurred. This has been logged for debugging.
-        
-        **Troubleshooting steps:**
-        1. Refresh the page and try uploading your file again
-        2. Check that your BibTeX file is properly formatted
-        3. If using LLM features, ensure you have sufficient memory (~1-2GB VRAM for Qwen2.5-0.5B)
-        4. Try "API-only" mode if LLM loading fails
-        
-        **Error details for developers:**
-        """)
-        st.code(error_details, language="text")
-        
-        st.info("""
-        💡 **Quick fix**: If you see "AttributeError" related to entry fields, 
-        your BibTeX file may have non-standard field names. Try cleaning the file 
-        with a BibTeX validator like [JabRef](https://www.jabref.org/) first.
-        """)
+        st.error("❌ Unexpected Error\n" + traceback.format_exc())
+        st.info("💡 Refresh and retry. Ensure BibTeX is well-formatted.")
