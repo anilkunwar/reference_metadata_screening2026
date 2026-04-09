@@ -1,0 +1,36 @@
+streamlit
+bibtexparser
+requests
+sentencepiece>=0.1.99  # For Qwen tokenizer
+protobuf>=3.20.0
+matplotlib
+scipy
+plotly
+pyvista
+numba
+meshio
+cupy-cuda12x  # For CUDA 11.x pip install cupy-cuda11x
+imageio
+imageio-ffmpeg
+seaborn
+torch
+torch-vision
+h5py
+msgpack
+dill
+joblib
+scikit-learn
+scikit-image
+pandas
+xgboost
+s3fs
+cmasher
+einops
+sentence-transformers
+transformers
+accelerate
+#opencv-python>=4.8.0
+opencv-python-headless
+pillow
+numpy
+pytesseract
